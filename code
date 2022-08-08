@@ -1,0 +1,646 @@
+library(dplyr)
+library(berryFunctions)
+library(Boruta)
+library(randomForest)
+library(Metrics)
+library(factoextra)
+library(ggplot2)
+library(caret)
+library(xgboost)
+library(pROC)
+library(baseballr)
+library(writexl)
+
+set.seed(123)
+
+data = read.csv("C:/Users/kaifr/Downloads/2018-2021data.csv")
+
+
+data = data %>%
+  arrange(game_date, home_team, away_team, inning, desc(inning_topbot), at_bat_number, pitch_number)
+
+
+FFvelos = data %>% # getting aggregate fastball data
+  group_by(player_name, game_year) %>%
+  filter(pitch_type %in% c("FF", "SI", "FT")) %>%
+  summarize(Fvelo = mean(release_speed, na.rm = T),
+            FmovX = mean(pfx_x, na.rm = T),
+            FmovZ = mean(pfx_z, na.rm = T))
+
+data = data %>%
+  inner_join(FFvelos, by = c("player_name", "game_year"))
+
+
+
+data2 = data %>% # data cleaning
+  mutate(pitch_type = ifelse(pitch_type == "FT", "SI", pitch_type),
+         pitch_type = ifelse(pitch_type == "KC", "CU", pitch_type),
+         pitch_type = ifelse(pitch_type == "FS", "CH", pitch_type)) %>%
+  filter(pitch_type %in% c("FF", "CU", "CH", "FC", "SI", "SL")) %>%
+  mutate(velo_diff = ifelse(pitch_type %in% c("CU", "CH", "SL", "FC"), release_speed - Fvelo, NA),
+         movX_diff = ifelse(pitch_type %in% c("CU", "CH", "SL", "FC"), pfx_x - FmovX, NA),
+         movZ_diff = ifelse(pitch_type %in% c("CU", "CH", "SL", "FC"), pfx_z - FmovZ, NA),
+         whiff = ifelse(description %in% c("swinging_strike", "swinging_strike_blocked"), 1, ifelse(description %in% c("hit_into_play", "foul", "foul_tip"), 0, NA)),
+         pfx_x_R = ifelse(p_throws == "R", pfx_x, -pfx_x),
+         release_x_R = ifelse(p_throws == "R", release_pos_x, -release_pos_x),
+         prev_pitcher = lag(player_name),
+         prev_batter = lag(batter),
+         prev_velo_d = ifelse(prev_pitcher != player_name | prev_batter != batter, NA, release_speed - lag(release_speed)),
+         prev_movX_d = ifelse(prev_pitcher != player_name | prev_batter != batter, NA, pfx_x - lag(pfx_x)),
+         prev_movZ_d = ifelse(prev_pitcher != player_name | prev_batter != batter, NA, pfx_z - lag(pfx_z)),
+         hitter = batter,
+         pitcher2 = player_name)
+
+
+dataCom = data2 %>% # setting up for model
+  select(game_date, game_year, player_name, inning, balls, strikes, description, des, outs_when_up, p_throws, stand, pitch_type, release_speed, plate_x, plate_z, pfx_x, pfx_x_R, pfx_z, release_spin_rate, spin_axis, release_pos_x, release_x_R, 
+         release_pos_z, release_pos_y, velo_diff, movX_diff, movZ_diff, prev_velo_d, prev_movX_d, prev_movZ_d, woba_value, estimated_woba_using_speedangle, delta_run_exp, whiff) %>%
+  filter(!is.na(release_speed),
+         !is.na(pfx_x),
+         !is.na(pfx_z),
+         !is.na(release_pos_x),
+         !is.na(release_pos_y),
+         !is.na(release_pos_z))
+
+whiff = dataCom %>% # filtering for plays with just whiffs
+  filter(!is.na(whiff))
+
+
+
+
+
+##### Boruta #####
+
+fBorutaData = whiff %>%
+  filter(pitch_type == c("FF", "SI"),
+         p_throws == "R",
+         stand == "R") %>%
+  select(release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y, release_spin_rate, whiff) %>%
+  na.omit() 
+
+fBorutaData$release_spin_rate = as.numeric(fBorutaData$release_spin_rate)
+
+
+borutaF = Boruta(as.factor(whiff) ~ release_speed + pfx_x + pfx_z + release_pos_x + # building boruta
+                   release_pos_z + release_pos_y + release_spin_rate, data = sample_n(fBorutaData, 25000))  
+
+
+feature_importanceF <- data.frame(attStats(borutaF))
+
+preboruta_dataF = feature_importanceF %>% 
+  select(meanImp, decision) %>%
+  arrange(desc(meanImp))
+
+attributesF = unlist(rownames(preboruta_dataF)) 
+preboruta_data2F = cbind(preboruta_dataF, attributesF)
+
+
+ggplot(preboruta_data2F, aes(reorder(attributesF, meanImp), meanImp, color = decision)) + # feature importance plot
+  geom_point(stat = "identity", size = 5) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 7)) +
+  scale_color_manual(values = c("Green", "Red")) +
+  labs(color = "Decision", title = "Boruta Importance Plot", caption = "Twitter: @kaifranke3") +
+  ylab("Importance") +
+  xlab("Variables")
+
+
+
+
+osBorutaData = whiff %>%
+  filter(pitch_type %in% c("CU", "SL", "FC", "CH"),
+         p_throws == "R",
+         stand == "R") %>%
+  select(release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y, release_spin_rate, velo_diff,
+         movX_diff, movZ_diff, whiff) %>%
+  na.omit()
+
+
+borutaOS = Boruta(as.factor(whiff) ~ release_speed + pfx_x + pfx_z + release_pos_x + release_pos_z + release_pos_y + velo_diff +
+                    movX_diff + movZ_diff, data = sample_n(osBorutaData, 50000)) # building offspeed boruta
+
+feature_importanceOS <- data.frame(attStats(borutaOS))
+
+preboruta_dataOS = feature_importanceOS %>% 
+  select(meanImp, decision) %>%
+  arrange(desc(meanImp))
+
+attributesOS = unlist(rownames(preboruta_dataOS)) 
+preboruta_data2OS = cbind(preboruta_dataOS, attributesOS)
+
+
+ggplot(preboruta_data2OS, aes(reorder(attributesOS, meanImp), meanImp, color = decision)) + # boruta plot
+  geom_point(stat = "identity", size = 5) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 7)) +
+  scale_color_manual(values = c("Green", "Red")) +
+  labs(color = "Decision", title = "Boruta Importance Plot", caption = "Twitter: @kaifranke3") +
+  ylab("Importance") +
+  xlab("Variables")
+
+
+
+
+##### XGBoost #####
+
+
+
+
+# FASTBALL MODEL
+
+
+FF = whiff %>%
+  filter(pitch_type == c("FF", "SI")) %>%
+  select(release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y, release_spin_rate, whiff)
+
+
+OS = whiff %>%
+  filter(pitch_type %in% c("FC", "SL", "CU", "CH")) %>%
+  select(release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y, release_spin_rate, whiff)
+
+
+
+trainIndexFF <- createDataPartition(FF$whiff, p = .75, list = FALSE, times = 1)
+trainFF <- FF[ trainIndexFF,]
+testFF <- FF[-trainIndexFF,]
+
+train_xFF = data.matrix(trainFF[, -8])
+train_yFF = as.numeric(unlist(trainFF[,8]))
+
+
+dtrainFF <- xgb.DMatrix(data = train_xFF, label = train_yFF)
+bstDMatrixFF <- xgboost(data = dtrainFF, max.depth = 3, eta = 0.1, nrounds = 200, eval_metric = "auc"
+                        , objective="binary:logistic")
+
+test_xFF = data.matrix(testFF[, -8])
+test_yFF = as.numeric(unlist(testFF[,8]))
+
+pred <- predict(bstDMatrixFF, test_xFF)
+
+testFFxg = as.data.frame(test_xFF)
+
+finalxgBFF = cbind(testFF, pred)
+
+auc(finalxgBFF$whiff, finalxgBFF$pred)
+
+
+
+
+
+rocF = roc(finalxgBFF$whiff, finalxgBFF$pred)
+ggroc(rocF) + # roc plot
+  theme_bw() + 
+  ylab("Sensitivity") +
+  xlab("Specificity") +
+  labs(caption = "Twitter: @kaifranke3") +
+  ggtitle(paste0('Fastball ROC Curve ', '(AUC = ', 0.608, ')')) + 
+  theme(aspect.ratio = 1)
+
+
+
+
+
+# OFFSPEED/MOVEMENT MODEL
+
+
+trainIndexOS <- createDataPartition(OS$whiff, p = .75, list = FALSE, times = 1)
+trainOS <- OS[ trainIndexOS,]
+testOS <- OS[-trainIndexOS,]
+
+train_xOS = data.matrix(trainOS[, -8])
+train_yOS = as.numeric(unlist(trainOS[,8]))
+
+
+dtrainOS <- xgb.DMatrix(data = train_xOS, label = train_yOS)
+bstDMatrixOS <- xgboost(data = dtrainOS, max.depth = 4, eta = 0.1, nrounds = 200, eval_metric = "auc"
+                        , objective="binary:logistic")
+
+test_xOS = data.matrix(testOS[, -8])
+test_yOS = as.numeric(unlist(testOS[,8]))
+
+pred <- predict(bstDMatrixOS, test_xOS)
+
+testOSxg = as.data.frame(test_xOS)
+
+finalxgBOS = cbind(testOS, pred)
+
+auc(finalxgBOS$whiff, finalxgBOS$pred)
+
+
+
+rocOS = roc(finalxgBOS$whiff, finalxgBOS$pred)
+ggroc(rocOS) + # roc plot
+  theme_bw() + 
+  ylab("Sensitivity") +
+  xlab("Specificity") +
+  labs(caption = "Twitter: @kaifranke3") +
+  ggtitle(paste0('Offspeed/Movement ROC Curve ', '(AUC = ', 0.579, ')')) + 
+  theme(aspect.ratio = 1)
+
+
+
+
+
+final = rbind(finalxgBFF, finalxgBOS)
+
+final2 = inner_join(dataCom, final, by = c("release_speed", "pfx_x", "pfx_z", "release_pos_x", "release_pos_z",
+                                "release_pos_y", "release_spin_rate", "whiff"))
+
+final3 = final2 %>%
+  mutate(`Stuff+` = 100 * (pred / mean(pred))) %>%
+  arrange(desc(`Stuff+`))
+
+
+
+
+
+
+
+
+
+# Applying model to rest of 2018-2021 data
+
+FF4 = dataCom %>%
+  filter(pitch_type == c("FF", "SI")) %>%
+  select(release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y, release_spin_rate, whiff)
+
+FF2 = FF4 %>%
+  select(-whiff)
+
+FF3 = as.matrix(FF2)
+
+pred <- predict(bstDMatrixFF, FF3)
+
+allFF = cbind(FF4, pred)
+
+
+
+
+OS4 = dataCom %>%
+  filter(pitch_type %in% c("FC", "CH", "CU", "SL")) %>%
+  select(release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y, release_spin_rate, whiff)
+
+OS2 = OS4 %>%
+  select(-whiff)
+
+OS3 = as.matrix(OS2)
+
+pred <- predict(bstDMatrixOS, OS3)
+
+allOS = cbind(OS4, pred)
+
+
+allStuff = rbind(allFF, allOS)
+
+auc(allStuff$whiff, allStuff$pred)
+
+
+rocAll = roc(allStuff$whiff, allStuff$pred)
+ggroc(rocAll) + # roc plot
+  theme_bw() + 
+  ylab("Sensitivity") +
+  xlab("Specificity") +
+  labs(caption = "Twitter: @kaifranke3") +
+  ggtitle(paste0('All Pitches ROC Curve ', '(AUC = ', 0.638, ')')) + 
+  theme(aspect.ratio = 1)
+
+rm(allFF, allOS, borutaF, borutaOS, data, data2, fBorutaData, feature_importanceF,
+   feature_importanceOS, FF, FF2, FF3, FF4, FFvelos, final, final2, final3, finalxgBFF, finalxgBOS, OS,
+   OS2, OS3, OS4, osBorutaData, preboruta_data2F, preboruta_data2OS, preboruta_dataF, preboruta_dataOS,
+   rocAll, rocF, rocOS, testFF, testFFxg, testOS, testOSxg, train_xFF, train_xOS, train_xFF, trainIndexFF,
+   trainIndexOS, attributesF, attributesOS, dtrainFF, dtrainOS, pred, test_yFF, test_yOS, 
+   train_yFF, train_yOS, test_xFF, test_xOS, trainFF, trainOS)
+
+
+
+
+
+allStuff2 = inner_join(allStuff, dataCom, by = c("release_speed", "pfx_x", "pfx_z", "release_pos_x", "release_pos_z",
+                                   "release_pos_y", "release_spin_rate", "whiff")) %>%
+  mutate(Stuff. = 100 * (pred / mean(pred, na.rm = T))) %>%
+  arrange(desc(Stuff.)) # adding stuff+ to the dataframe
+
+
+
+
+leaders = allStuff2 %>%
+  group_by(player_name, pitch_type, game_year) %>%
+  summarize(n = n(),
+            Stuff. = mean(Stuff., na.rm = T))
+
+
+
+
+#### 2022 Preds #####
+
+data1 = scrape_statcast_savant(start_date = "2022-04-07",
+                               end_date = "2022-04-13",
+                               player_type = "pitcher")
+
+data2 = scrape_statcast_savant(start_date = "2022-04-14",
+                               end_date = "2022-04-20",
+                               player_type = "pitcher")
+
+data3 = scrape_statcast_savant(start_date = "2022-04-21",
+                               end_date = "2022-04-27",
+                               player_type = "pitcher")
+
+data4 = scrape_statcast_savant(start_date = "2022-04-28",
+                               end_date = "2022-05-01",
+                               player_type = "pitcher")
+
+data5 = scrape_statcast_savant(start_date = "2022-05-02",
+                               end_date = "2022-05-06",
+                               player_type = "pitcher")
+
+data6 = scrape_statcast_savant(start_date = "2022-05-07",
+                               end_date = "2022-05-13",
+                               player_type = "pitcher")
+
+data7 = scrape_statcast_savant(start_date = "2022-05-14",
+                               end_date = "2022-05-20",
+                               player_type = "pitcher")
+
+data8 = scrape_statcast_savant(start_date = "2022-05-21",
+                               end_date = "2022-05-27",
+                               player_type = "pitcher")
+
+data9 = scrape_statcast_savant(start_date = "2022-05-28",
+                               end_date = "2022-06-01",
+                               player_type = "pitcher")
+
+data10 = scrape_statcast_savant(start_date = "2022-06-02",
+                                end_date = "2022-06-06",
+                                player_type = "pitcher")
+
+data11 = scrape_statcast_savant(start_date = "2022-06-07",
+                                end_date = "2022-06-13",
+                                player_type = "pitcher")
+
+data12 = scrape_statcast_savant(start_date = "2022-06-14",
+                                end_date = "2022-06-20",
+                                player_type = "pitcher")
+
+data13 = scrape_statcast_savant(start_date = "2022-06-21",
+                                end_date = "2022-06-27",
+                                player_type = "pitcher")
+
+data14 = scrape_statcast_savant(start_date = "2022-06-28",
+                                end_date = "2022-07-01",
+                                player_type = "pitcher")
+
+data15 = scrape_statcast_savant(start_date = "2022-07-02",
+                                end_date = "2022-07-06",
+                                player_type = "pitcher")
+
+data16 = scrape_statcast_savant(start_date = "2022-07-07",
+                                end_date = "2022-07-13",
+                                player_type = "pitcher")
+
+data17 = scrape_statcast_savant(start_date = "2022-07-14",
+                                end_date = "2022-07-20",
+                                player_type = "pitcher")
+
+data18 = scrape_statcast_savant(start_date = "2022-07-21",
+                                end_date = "2022-07-27",
+                                player_type = "pitcher")
+
+data19 = scrape_statcast_savant(start_date = "2022-07-28",
+                                end_date = "2022-08-01",
+                                player_type = "pitcher")
+
+data2022 = rbind(data1, data2, data3, data4, data5, data6, data7, data8, data9, data10, 
+                 data11, data12, data13, data14, data15, data16, data17, data18, data19)
+
+rm(data1, data2, data3, data4, data5, data6, data7, data8, data9, data10, 
+   data11, data12, data13, data14, data15, data16, data17, data18, data19)
+
+
+data20221 = data2022 %>%
+  mutate(whiff = ifelse(description %in% c("swinging_strike", "swinging_strike_blocked"), 1, ifelse(description %in% c("hit_into_play", "foul", "foul_tip"), 0, NA))) %>%
+  select(player_name, pitch_type, release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y, release_spin_rate, whiff)
+
+summ2022 = data20221 %>%
+  filter(pitch_type %in% c("FF", "FT", "SI", "FC", "SL", "KC", "FS", "CU", "CH")) %>%
+  mutate(pitch_type = ifelse(pitch_type == "FT", "SI", pitch_type),
+         pitch_type = ifelse(pitch_type == "KC", "CU", pitch_type)) %>%
+  group_by(pitch_type, player_name) %>%
+  summarize(n = n(),
+            whiff. = mean(whiff, na.rm = T))
+
+# correlation plot
+
+summ2021 = allStuff2 %>%
+  filter(game_year == 2021) %>%
+  group_by(pitch_type, player_name) %>%
+  summarize(n = n(),
+            pwhiff. = mean(pred, na.rm = T))
+
+
+
+corr2122 = right_join(summ2021, summ2022, by = c("pitch_type", "player_name")) %>%
+  filter(pwhiff. >= 0,
+         whiff. >= 0,
+         n.x >= 100, 
+         n.y >= 60)
+
+cor(corr2122$pwhiff., corr2122$whiff.)^2
+
+
+ggplot(filter(corr2122), aes(pwhiff., whiff.)) +
+  geom_point() +
+  stat_smooth() +
+  theme_bw() +
+  labs(title = "2021 Predicted Whiff% vs 2022 Actual Whiff%", subtitle = "Minimum 100 Pitches in 2021 and 60 Pitches in 2022",
+       caption = "Twitter @kaifranke3", x = "2021 Predicted Whiff%", y = "2022 Actual Whiff%") +
+  geom_text(x = 0.15, y = 0.55, label = paste0('R^2 = ', round(cor(corr2122$pwhiff., corr2122$whiff.)^2, 3)), size = 5)
+
+
+
+
+# applying model to 2022
+
+
+FF2022 = data20221 %>%
+  filter(pitch_type %in% c("FF", "SI")) %>%
+  select(release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y, release_spin_rate, whiff)
+
+FF20222 = FF2022 %>%
+  select(-whiff)
+
+FF20223 = as.matrix(FF20222)
+
+pred <- predict(bstDMatrixFF, FF20223)
+
+allFF2022 = cbind(FF2022, pred)
+
+
+
+
+
+OS2022 = data20221 %>%
+  filter(pitch_type %in% c("CH", "CU", "FC", "SL")) %>%
+  select(release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y, release_spin_rate, whiff)
+
+OS20222 = OS2022 %>%
+  select(-whiff)
+
+OS20223 = as.matrix(OS20222)
+
+pred <- predict(bstDMatrixOS, OS20223)
+
+allOS2022 = cbind(OS2022, pred)
+
+
+allStuff2022 = rbind(allFF2022, allOS2022)
+
+
+final2022 = inner_join(data2022, allStuff2022, by = c("release_speed", "pfx_x", "pfx_z", "release_pos_x", "release_pos_z",
+                                                      "release_pos_y", "release_spin_rate"))
+
+final20223 = final2022 %>%
+  select(pred, player_name, pitch_type, des, description, game_date, inning, balls, strikes, outs_when_up, inning_topbot, home_team, away_team,
+         release_speed, pfx_x, pfx_z, release_pos_x, release_pos_z, release_pos_y)
+
+
+
+
+Stuff2022 = final20223 %>%
+  mutate(`Stuff+` = 100 * (pred / mean(pred))) %>%
+  arrange(desc(`Stuff+`))
+
+
+# making leaderboards
+
+write_xlsx(Stuff2022 %>%
+             filter(pitch_type == "FF") %>%
+             group_by(player_name) %>%
+             summarize(n = n(),
+                       Stuff. = mean(`Stuff+`, na.rm = T)) %>%
+             arrange(desc(Stuff.)) %>%
+             filter(n >= 60) %>%
+             head(10), "C:FFStuffLeaders.xlsx")
+
+
+write_xlsx(Stuff2022 %>%
+             filter(pitch_type == "CU") %>%
+             group_by(player_name) %>%
+             summarize(n = n(),
+                       Stuff. = mean(`Stuff+`, na.rm = T)) %>%
+             arrange(desc(Stuff.)) %>%
+             filter(n >= 60) %>%
+             head(10), "C:CUStuffLeaders.xlsx")
+
+
+write_xlsx(Stuff2022 %>%
+             filter(pitch_type == "CH") %>%
+             group_by(player_name) %>%
+             summarize(n = n(),
+                       Stuff. = mean(`Stuff+`, na.rm = T)) %>%
+             arrange(desc(Stuff.)) %>%
+             filter(n >= 60) %>%
+             head(10), "C:CHStuffLeaders.xlsx")
+
+
+write_xlsx(Stuff2022 %>%
+             filter(pitch_type == "SL") %>%
+             group_by(player_name) %>%
+             summarize(n = n(),
+                       Stuff. = mean(`Stuff+`, na.rm = T)) %>%
+             arrange(desc(Stuff.)) %>%
+             filter(n >= 60) %>%
+             head(10), "C:SLStuffLeaders.xlsx")
+
+
+write_xlsx(Stuff2022 %>%
+             filter(pitch_type == "FC") %>%
+             group_by(player_name) %>%
+             summarize(n = n(),
+                       Stuff. = mean(`Stuff+`, na.rm = T)) %>%
+             arrange(desc(Stuff.)) %>%
+             filter(n >= 60) %>%
+             head(10), "C:FCStuffLeaders.xlsx")
+
+
+write_xlsx(Stuff2022 %>%
+             filter(pitch_type == "SI") %>%
+             group_by(player_name) %>%
+             summarize(n = n(),
+                       Stuff. = mean(`Stuff+`, na.rm = T)) %>%
+             arrange(desc(Stuff.)) %>%
+             filter(n >= 60) %>%
+             head(10), "C:SIStuffLeaders.xlsx")
+
+
+
+
+
+#### Pitch Design Example ####
+
+
+# adjusting the stuff variables to having the average at 100
+
+FFstuff = final20223 %>%
+  filter(pitch_type == "FF") %>%
+  mutate(Stuff. = 100 * (pred / mean(pred, na.rm = T)),
+         Stuff.. = 100 * (Stuff. / mean(Stuff., na.rm = T)))
+
+CUstuff = final20223 %>%
+  filter(pitch_type == "CU") %>%
+  mutate(Stuff. = 100 * (pred / mean(pred, na.rm = T)),
+         Stuff.. = 100 * (Stuff. / mean(Stuff., na.rm = T)))
+
+SLstuff = final20223 %>%
+  filter(pitch_type == "SL") %>%
+  mutate(Stuff. = 100 * (pred / mean(pred, na.rm = T)),
+         Stuff.. = 100 * (Stuff. / mean(Stuff., na.rm = T)))
+
+CHstuff = final20223 %>%
+  filter(pitch_type == "CH") %>%
+  mutate(Stuff. = 100 * (pred / mean(pred, na.rm = T)),
+         Stuff.. = 100 * (Stuff. / mean(Stuff., na.rm = T)))
+
+SIstuff = final20223 %>%
+  filter(pitch_type == "SI") %>%
+  mutate(Stuff. = 100 * (pred / mean(pred, na.rm = T)),
+         Stuff.. = 100 * (Stuff. / mean(Stuff., na.rm = T)))
+
+FCstuff = final20223 %>%
+  filter(pitch_type == "FC") %>%
+  mutate(Stuff. = 100 * (pred / mean(pred, na.rm = T)),
+         Stuff.. = 100 * (Stuff. / mean(Stuff., na.rm = T)))
+
+
+adjStuff = rbind(FFstuff, CUstuff, SLstuff, CHstuff, SIstuff, FCstuff) 
+
+
+
+leaders = adjStuff %>%
+  group_by(player_name, pitch_type) %>%
+  summarize(n = n(),
+            Stuff.. = round(mean(Stuff.., na.rm = T),0),
+            velo = round(mean(release_speed, na.rm = T),1),
+            pfx_x = round(mean(pfx_x, na.rm = T),2),
+            pfx_z = round(mean(pfx_z, na.rm = T),2),
+            release_pos_x = round(mean(release_pos_x, na.rm = T), 2),
+            release_pos_y = round(mean(release_pos_y, na.rm = T), 2),
+            release_pos_z = round(mean(release_pos_z, na.rm = T), 2)) %>%
+  filter(n >= 60) %>%
+  arrange(desc(Stuff..))
+
+
+# controlling for velo and release position
+
+CH8688 = CHstuff %>%
+  filter(release_speed >= 86 & release_speed <= 88,
+         release_pos_z >= 5.9 & release_pos_z <= 6.5,
+         release_pos_x >= -1.75 & release_pos_x <= -1.45)
+
+ggplot(CH8688, aes(-pfx_x, pfx_z, z = Stuff..)) +
+  stat_summary_hex() +
+  scale_fill_gradient2(midpoint = 100, low = "blue", mid = "white", high = "red") +
+  geom_point(aes(x=1.06, y=0.78), colour="black", size = 5) +
+  geom_point(aes(x=1.2, y=0.5), colour="green", size = 5) +
+  theme_bw() +
+  labs(title = "Chris Archer's Modified Changeup Stuff+ (Pitcher's Perspective)", subtitle = "CH Velo 86-88, Vertical Release Point 5.9-6.5, Horizontal Release Point 1.45-1.75",
+       x = "Horizontal Movement", y = "Vertical Movement", fill = "Stuff+", caption = "Twitter: @kaifranke3")
