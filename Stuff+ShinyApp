@@ -1,0 +1,126 @@
+library(shiny)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+
+allStuff2 = read.csv("appData.csv")
+allStuff2$player_name = iconv(allStuff2$player_name,from="UTF-8",to="ASCII//TRANSLIT")
+allStuff2 = allStuff2 %>%
+  mutate(pitch_type = ifelse(pitch_type == "FF", "Fourseam Fastball", pitch_type),
+         pitch_type = ifelse(pitch_type == "SI", "Sinker", pitch_type),
+         pitch_type = ifelse(pitch_type == "FC", "Cutter", pitch_type),
+         pitch_type = ifelse(pitch_type == "SL", "Slider", pitch_type),
+         pitch_type = ifelse(pitch_type == "CU", "Curveball", pitch_type),
+         pitch_type = ifelse(pitch_type == "CH", "Changeup", pitch_type)) %>%
+  arrange(player_name) 
+
+
+ui <- fluidPage(
+  
+  
+  titlePanel("2022 Stuff+ Dashboard"),
+  theme = shinythemes::shinytheme("journal"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      selectInput('name',
+                  'Select Pitcher:',
+                  choices = unique(allStuff2$player_name)),
+      selectInput('pitch_type',
+                  'Select Pitch Type (If error, select different pitch):',
+                  choices = c('Fourseam Fastball', 'Sinker', 'Cutter', 'Slider', 'Curveball', 'Changeup'),
+                  selected = 'Fourseam Fastball')),
+    
+    
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Pitch Design",
+                 plotOutput("stuffPlot"),
+                 tableOutput("table")),
+        tabPanel("Leaderboard", DT::DTOutput("leaders"))
+    ))
+  )
+)
+
+
+server <- function(input, output) {
+  
+  pitcherAvg = reactive({
+    
+    allStuff2 %>%
+      filter(player_name == input$name,
+             pitch_type == input$pitch_type) %>%
+      group_by(pitch_type) %>%
+      summarise(velo = mean(release_speed, na.rm = T),
+                pfx_x = -mean(pfx_x, na.rm = T),
+                pfx_z = mean(pfx_z, na.rm = T),
+                rp_x = mean(release_pos_x, na.rm = T),
+                rp_z = mean(release_pos_z, na.rm = T),
+                p_throws = p_throws[1],
+                Stuff. = mean(Stuff., na.rm = T))
+  })
+  
+  output$stuffPlot = renderPlot({
+    ggplot(filter(allStuff2, pitch_type == input$pitch_type, 
+                  p_throws == pitcherAvg()$p_throws, 
+                  release_pos_x >= pitcherAvg()$rp_x - 0.5, 
+                  release_pos_x <= pitcherAvg()$rp_x + 0.5, 
+                  release_pos_z >= pitcherAvg()$rp_z - 0.5, 
+                  release_pos_z <= pitcherAvg()$rp_z + 0.5, 
+                  release_speed >= pitcherAvg()$velo - 1, 
+                  release_speed <= pitcherAvg()$velo + 1), 
+           aes(x = -pfx_x, y = pfx_z, z = Stuff.)) +
+      stat_summary_2d() +
+      scale_fill_gradient2(midpoint = 100, low = "blue", mid = "white", high = "red") +
+      geom_point(aes(x=pitcherAvg()$pfx_x, y=pitcherAvg()$pfx_z), colour="black", size = 5) +
+      theme_bw() +
+      labs(x = 'Horizontal Movement', y = 'Vertical Movement', fill = 'Stuff+', 
+           title = paste(strsplit(input$name, ", ")[[1]][1], "'s Stuff+ by Location for ", input$pitch_type, sep = ""), 
+           subtitle = "Based off of Pitchers with Similar Release Point and Velocity (Pitcher's Point of View)", 
+           caption = 'Email: fran1412@umn.edu') +
+      coord_fixed() +
+      geom_vline(xintercept = 0) +
+      geom_hline(yintercept = 0) +
+      xlim(-2.5,2.5) +
+      ylim(-2.5,2.5)
+  })
+  
+  
+  output$table = renderTable({
+    allStuff2 %>%
+      filter(player_name == input$name,
+             pitch_type == input$pitch_type) %>%
+      group_by(pitch_type) %>%
+      summarise(Velocity = mean(release_speed, na.rm = T),
+                `Horiz. Break` = -mean(pfx_x, na.rm = T),
+                `Vert. Break` = mean(pfx_z, na.rm = T),
+                `Horiz. Release Point` = -mean(release_pos_x, na.rm = T),
+                `Vert. Release Point` = mean(release_pos_z, na.rm = T),
+                `Stuff+` = as.integer(round(mean(Stuff., na.rm = T), 0))) %>%
+      dplyr::select(-pitch_type)
+    
+  })
+  
+  output$leaders = DT::renderDT({
+    allStuff2 %>%
+      group_by(player_name, pitch_type) %>%
+      filter(input$pitch_type == pitch_type) %>%
+      summarise(Pitches = n(),
+                `Stuff+` = round(mean(Stuff., na.rm = T), 0),
+                Velocity = round(mean(release_speed, na.rm = T), 1),
+                `Horizontal Mvt.` = round(-mean(pfx_x, na.rm = T), 2),
+                `Vertical Mvt.` = round(mean(pfx_z, na.rm = T), 2),
+                `Horizontal Release` = round(mean(release_pos_x, na.rm = T), 2),
+                `Vertical Release` = round(mean(release_pos_z, na.rm = T), 2)) %>%
+      rename(`Player Name` = player_name,
+             `Pitch Type` = pitch_type) %>%
+      filter(Pitches >= 50) %>%
+      arrange(desc(`Stuff+`))
+  })
+  
+  
+}
+
+
+shinyApp(ui = ui, server = server)
